@@ -1,0 +1,296 @@
+#!/usr/bin/env expect
+# add a -d to the line above to enable some expect debugging
+#script to enable cloud pairing on a 220 endpoint
+#assumes the current auto password is the default "lifesize"
+
+# Default variable values
+log_user 0
+set timeout 15
+set debug_mode 0
+set password "lifesize\r"
+set force_disable 0
+
+proc debug_print { print_string } {
+        global debug_mode
+        if { $debug_mode != 0 } {
+                puts $print_string
+        }
+}
+
+#******************************************************************************
+# getopts
+#
+# Parse the options from argvret into the array optsret.  Optstr is a string
+# of valid option letters, with a colon following each non-boolean option
+# letter (each option which takes an option argument).
+#
+# Options start with "-", except for the non-options "--", which is skipped
+# over, and "-".  Specifying the bundled option "-" is not allowed.  Option
+# processing terminates upon encountering the first non-option.  Multiple
+# options can be bundled into a single argument.  The value of non-boolean
+# options is taken from the remainder of the argument or the next argument
+# if the remainder is empty.
+#
+# On error, argvret is not modified, optsret(error) contains an error
+# message, optsret(opt) contains the offending option, and -1 is returned.
+#
+# On success, the parsed options are removed from argvret, optsret(error)
+# and optsret(opt) contain an empty string, and 0 is returned.  For each
+# boolean option, the corresponding element of optsret is set to 0 (false)
+# or 1 (true).  For non-boolean options, the corresponding element of
+# optsret contains whatever value was specified.  For non-boolean options
+# which are not specified, the corresponding element of optsret is not
+# created and/or modified.
+
+proc getopts { optstr argvret optsret } {
+   upvar $argvret argv
+   upvar $optsret opts
+
+   # initialize opts array with all boolean options set to 0 (false)
+   set opts(error) [ set opts(opt) "" ]
+   set opts_list [ split $optstr "" ]
+   for { set idx 0 } { $idx < [ llength $opts_list ] } { incr idx } {
+      if {[ lindex $opts_list [ expr $idx+1 ]] == ":" } {
+         incr idx
+      } else {
+         set opts([ lindex $opts_list $idx ]) 0
+      }
+   }
+
+   set arg_idx 0
+   while { $arg_idx < [ llength $argv ]} {
+      set curr_arg [ lindex $argv $arg_idx ]
+      if {[ string index $curr_arg 0 ] != "-" } { break }
+      if { $curr_arg == "-" } { break }
+      if { $curr_arg == "--" } { incr arg_idx; break }
+      incr arg_idx
+      set ch_idx 1
+      while {1} {
+         set opt_ch [ string index $curr_arg $ch_idx ]
+         if { $opt_ch == "" } { break }
+         incr ch_idx
+         if { $opt_ch == "-" } {
+            set opts(error) "invalid option -"
+            set opts(opt) "-"
+            return -1
+         }
+         set pos [ string first $opt_ch $optstr ]
+         if { $pos < 0 || ( $opt_ch == ":" && $pos > 0 )} {
+            set opts(error) "invalid option $opt_ch"
+            set opts(opt) $opt_ch
+            return -1
+         }
+         if {[ string index $optstr [ incr pos ]] != ":" } {
+            incr opts($opt_ch)
+            continue
+         }
+         set optarg [ string range $curr_arg $ch_idx end ]
+         if { $optarg == "" } {
+            if { $arg_idx >= [ llength $argv ]} {
+               set opts(error) "missing argument for option $opt_ch"
+               set opts(opt) $opt_ch
+               return -1
+            }
+            set optarg [ lindex $argv $arg_idx ]
+            incr arg_idx
+         }
+         set opts($opt_ch) $optarg
+         break
+      }
+   }
+   set argv [ lrange $argv $arg_idx end ]
+   return 0
+}
+
+#******************************************************************************
+# define $prog and $usagemsg
+
+set prog $::argv0
+regsub {.*/} $prog "" prog
+
+set my_optstr "?p:dv"
+set usagemsg "
+usage: $prog \[-p PASSWORD] IP
+  -p  password for 220 auto user
+  -d  force disable first if we are already enabled
+  -v  enable verbose messages for debug (add multiple to get more debug info)
+  IP  IP address (or hostname) of system to pair
+"
+regsub -all {\A\n|\n\Z} $usagemsg "" usagemsg   ;# remove leading/trailing \n
+
+#******************************************************************************
+# usage message procedure, using $prog and $usagemsg
+
+proc usage {{ msg "" }} {
+   global prog usagemsg
+   if { $msg != "" } { puts stderr "$prog: $msg" }
+   puts stderr $usagemsg
+}
+
+#******************************************************************************
+# process command line parameters 
+if {[ getopts $my_optstr argv opts ] || $opts(?) } { usage $opts(error); exit 1 }
+
+if {[info exists opts(p)]} {
+        set password $opts(p)
+}
+
+if { $opts(d) == 1 } {
+        set force_disable 1
+}
+
+if { $opts(v) > 0 } {
+        set debug_mode $opts(v)
+        if { $debug_mode >= 2 } {
+                log_user 1
+        }
+}
+
+if {  [llength $argv] != 1 } {
+        puts stderr "A single IP address or hostname is required"
+        usage 
+        exit 1
+}
+
+if { $force_disable == 1 } {
+        debug_print ">>>>>>>>>>>>>> Forcing disable of lscloud..."
+        spawn ssh auto@$argv set lscloud disable
+        while (1) {
+                expect { 
+                        "(yes/no)?"     {send "yes\r" ; exp_continue}
+                        "Permission denied, please try again." {puts stderr "Password on $argv is not what we expect. Aborting"; exit 1}
+                        "password"              {send $password; exp_continue}
+                        "error,.*"              {puts stderr "Auto shell error:" expect_out(0,string); exit 1}
+                        "ok,00"                 {break}
+                        "No route to host"      {puts stderr "Unable to reach $argv"; exit 1}
+                        "Connection refused"    {puts stderr "Unable to connect to $argv"; exit 1}
+                        "Could not resolve"     {puts stderr "Unable to reach $argv"; exit 1}
+                        timeout                 {puts stderr "Unable to reach $argv"; exit 1}
+                }
+        }
+        # wait a bit after the disable command
+        debug_print "Pause after disable command"
+        sleep 10
+}
+
+# first we check the current status to make sure we are not already paired or in some other state.
+# if we are disabled, then we'll try to enable
+# if we are in pairing mode, then we'll try to get the pairing code and pair
+# otherwise we'll abort
+set lscloud_status ""
+debug_print ">>>>>>>>>>>>>> Checking current status..."
+spawn ssh auto@$argv get lscloud status
+while (1) {
+        expect { 
+                "(yes/no)?"             {send "yes\r" ; exp_continue}
+                "Permission denied, please try again." {send_user "Password on $argv is not what we expect. Aborting"; exit 1}
+                "password"              {send $password; exp_continue}
+                "Disabled"              {set lscloud_status "disabled";break} 
+                "Connected"             {puts stderr "Already Connected."; exit 1}
+                "Pairing"               {set lscloud_status "pairing";break}
+                "Unknown Error"         {puts stderr "Unknown error."; exit 1}
+                "Server Unreachable"    {puts stderr "Server Unreachable."; exit 1}
+                "Invalid Credentials"   {puts stderr "Invalid Credentials."; exit 1}
+                "Account Disabled"      {puts stderr "Account Disabled."; exit 1}
+                "Account Group Disabled" {puts stderr "Account Group Disabled."; exit 1}
+                "Account Expired"       {puts stderr "Account Expired."; exit 1}
+                "Pairing Disabled"      {puts stderr "Pairing Disabled."; exit 1}
+                "Pairing Invalid AMS"   {puts stderr "Pairing Invalid AMS."; exit 1}
+                "No route to host"      {puts stderr "Unable to reach $argv"; exit 1}
+                "Connection refused"    {puts stderr "Unable to connect to $argv"; exit 1}
+                "Could not resolve"     {puts stderr "Unable to reach $argv"; exit 1}
+                "error,09"              {puts stderr "Error using \"get lscloud status\" command -- $argv may be on the wrong software version"; exit 1}
+                "error,*"               {puts stderr "Auto shell error: $expect_out(0,string)"; exit 1}
+                timeout                 {puts stderr "Unable to reach $argv"; exit 1}
+        }
+}
+
+if { $force_disable == 1 && $lscloud_status != "disabled" } {
+        puts stderr "Unable to disable lscloud on $argv."
+        exit 1
+}
+
+# if we're disabled, then try to enable
+if { $lscloud_status == "disabled" } {
+        debug_print ">>>>>>>>>>>>>> Trying to enable lscloud"
+        spawn ssh auto@$argv set lscloud enable
+        while (1) {
+                expect { 
+                        "(yes/no)?"     {send "yes\r" ; exp_continue}
+                        "Permission denied, please try again." {puts stderr "Password on $argv is not what we expect. Aborting"; exit 1}
+                        "password"              {send $password; exp_continue}
+                        "error,.*"              {puts stderr "Auto shell error:" expect_out(0,string); exit 1}
+                        "ok,00"                 {break}
+                        "No route to host"      {puts stderr "Unable to reach $argv"; exit 1}
+                        "Connection refused"    {puts stderr "Unable to connect to $argv"; exit 1}
+                        "Could not resolve"     {puts stderr "Unable to reach $argv"; exit 1}
+                        timeout                 {puts stderr "Unable to reach $argv"; exit 1}
+                }
+        }
+}
+
+# give the system a bit of time to go initiate the connection to lscloud
+sleep 3
+
+set in_pairing_mode 0
+set server_unreachable_count 0
+
+if { $lscloud_status != "pairing" } {
+        while { $in_pairing_mode==0 && $server_unreachable_count < 10} {
+                debug_print ">>>>>>>>>>>>>> Checking lscloud status"
+                spawn ssh auto@$argv get lscloud status
+                while (1) {
+                        expect { 
+                                "(yes/no)?"              {send "yes\r" ; exp_continue}
+                                "Permission denied, please try again." {puts stderr "Password on $argv is not what we expect. Aborting"; exit 1}
+                                "password"               {send $password; exp_continue}
+                                "Disabled"               {puts stderr "Still in disabled state for $argv."; exit 1}
+                                "Connected"              {puts stderr "Already Connected for $argv."; exit 1}
+                                "Pairing"                {set in_pairing_mode 1; break}
+                                "Unknown Error"          {puts stderr "Unknown error $argv."; exit 1}
+                                "Server Unreachable"     {incr server_unreachable_count; break}
+                                "Invalid Credentials"    {puts stderr "Invalid Credentials $argv."; exit 1}
+                                "Account Disabled"       {puts stderr "Account Disabled for $argv."; exit 1}
+                                "Account Group Disabled" {puts stderr "Account Group Disabled for $argv."; exit 1}
+                                "Account Expired"        {puts stderr "Account Expired for $argv."; exit 1}
+                                "Pairing Disabled"       {puts stderr "Pairing Disabled for $argv."; exit 1}
+                                "Pairing Invalid AMS"    {puts stderr "Pairing Invalid AMS for $argv."; exit 1}
+                                "No route to host"       {puts stderr "Unable to reach $argv"; exit 1}
+                                "Connection refused"     {puts stderr "Unable to connect to $argv"; exit 1}
+                                "Could not resolve"      {puts stderr "Unable to reach $argv"; exit 1}
+                                "error,*"                {puts stderr "Auto shell error: $expect_out(0,string)"; exit 1}
+                                timeout                  {puts stderr "Unable to reach $argv"; exit 1}
+                        }
+                }
+                sleep 1
+        }
+}
+
+# go try to get the pairing code
+# if it is blank for an extended period of time (we'll assume 10 retries), then
+# it most likely means that the pairing mode was a remnant from an old attempt and
+# we will not ever get a response. 
+set pairing_code ""
+set retry_max 10
+set retry_count 0
+
+while { $pairing_code == "" && $retry_count <= $retry_max } {
+        debug_print ">>>>>>>>>>>>>> Trying to get pairing code"
+        spawn ssh auto@$argv get lscloud pairingcode
+        while (1) {
+                expect { 
+                        "(yes/no)?"             {send "yes\r" ; exp_continue}
+                        "Permission denied, please try again." {puts stderr "Password on $argv is not what we expect. Aborting"; exit 1}
+                        "password"              {send $password; exp_continue}
+                        {[0-9][0-9][0-9][0-9][0-9][0-9]}                { set pairing_code $expect_out(0,string) ;
+                                                        puts "Pairing code for $argv is $pairing_code"; exit 0}
+                        "ok,00"                 {incr retry_count; break}
+                        "error,*"               {puts stderr "Auto shell error on $argv: $expect_out(0,string)"; exit 1}
+                        timeout                 {puts stderr "Unable to reach $argv"; exit 1}
+                }
+        }
+        sleep 1
+}
+
+puts stderr "Unable to retrieve pairing code, retry with -d option to force disable/enable"
+
